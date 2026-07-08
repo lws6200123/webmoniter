@@ -1,8 +1,10 @@
 """
 网页抓取模块：静态页面 (requests+BS4) + 动态页面 (Playwright)
-支持列表->详情页面的自动跟踪
+支持列表->详情弹窗跟踪、日期过滤、结构化信息提取
 """
+import re
 import time
+from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 from readability import Document
@@ -19,7 +21,7 @@ CONTENT_SELECTORS = [
     'article', 'main', '[role="main"]',
     '.post-content', '.article-content', '.entry-content',
     '.detail-content', '.news-content', '.info-content',
-    '#content', '.content', '.main-content',
+    '#content', '.content', '.main-content', '.detail',
 ]
 
 
@@ -28,11 +30,9 @@ def fetch_static(url: str) -> str:
     resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding
-
     doc = Document(resp.text)
     soup = BeautifulSoup(doc.summary(), "lxml")
     text = soup.get_text(separator="\n", strip=True)
-
     if len(text) > MAX_CONTENT_LENGTH:
         text = text[:MAX_CONTENT_LENGTH] + "\n\n... [内容过长，已截断]"
     return text
@@ -50,66 +50,108 @@ def _extract_page_text(page) -> str:
         }}
         return document.body ? document.body.outerHTML : '';
     }}""")
-
     if not article_html:
         return ""
-
     soup = BeautifulSoup(article_html, "lxml")
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
     return soup.get_text(separator="\n", strip=True)
 
 
-def _find_list_items(page) -> list[dict]:
+def _extract_list_items_with_dates(page) -> list[dict]:
     """
-    在列表中找出可点击的条目
-    返回 [{"text": "标题文字", "href": "链接或onclick"}, ...]
+    从列表页提取条目标题+日期
+    返回 [{"text": "标题", "date": "2026-07-08", "href": "...", "row_html": "..."}, ...]
     """
     items = page.evaluate("""() => {
         const results = [];
         const seenTexts = new Set();
 
-        // 优先在列表/表格区域找
-        const containers = document.querySelectorAll(
-            'table a, ul a, ol a, .list a, [class*="list"] a, [id*="list"] a, ' +
-            '.news a, [class*="news"] a, .jobs a, [class*="job"] a, ' +
-            '.content a, [class*="item"] a, .entry a'
+        // 找所有可能是列表项的容器
+        const rows = document.querySelectorAll(
+            'table tr, .list-item, [class*="item"], .news-item, ' +
+            '[class*="row"], .entry, li, .post'
         );
-        const anchors = containers.length > 0 ? containers : document.querySelectorAll('a');
 
-        for (let i = 0; i < anchors.length; i++) {
-            const a = anchors[i];
-            const text = (a.innerText || a.textContent || '').trim();
+        for (const row of rows) {
+            const anchors = row.querySelectorAll('a');
+            for (const a of anchors) {
+                const text = (a.innerText || a.textContent || '').trim();
+                if (!text || text.length < 8) continue;
+                if (text === '下一页' || text === '上一页' || text === '首页' || text === '尾页') continue;
+                if (text === '查看详情' || text === '详情') continue;
+                if (/^[0-9]+$/.test(text)) continue;
+                if (text.length > 120) continue;
 
-            if (!text || text.length < 8) continue;
-            if (text === '下一页' || text === '上一页' || text === '首页' || text === '尾页') continue;
-            if (text === '查看详情') continue;
-            if (/^[0-9]+$/.test(text)) continue;
-            if (text.length > 120) continue;
+                const rect = a.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
 
-            const rect = a.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) continue;
+                const key = text.substring(0, 40);
+                if (seenTexts.has(key)) continue;
+                seenTexts.add(key);
 
-            const key = text.substring(0, 40);
-            if (seenTexts.has(key)) continue;
-            seenTexts.add(key);
+                // 取整个行的文本（含日期）
+                const rowText = (row.innerText || row.textContent || '').trim();
 
-            results.push({
-                text: text.substring(0, 100),
-                href: a.href || a.getAttribute('onclick') || '',
-                tagName: a.tagName
-            });
+                results.push({
+                    text: text.substring(0, 100),
+                    rowText: rowText.substring(0, 300),
+                    href: a.href || a.getAttribute('onclick') || ''
+                });
+                break; // 每行只取第一个有效链接
+            }
         }
         return results;
     }""")
 
-    return items
+    # 从 rowText 中解析日期
+    today = datetime.now().date()
+    cutoff = today - timedelta(days=3)
+
+    parsed_items = []
+    for item in items:
+        # 尝试提取日期
+        date_str = None
+        date_patterns = [
+            r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
+            r'更新时间[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
+            r'发布日期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
+            r'日期[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
+        ]
+        for pattern in date_patterns:
+            match = re.search(pattern, item["rowText"])
+            if match:
+                date_str = match.group(1)
+                break
+
+        # 解析日期
+        item_date = None
+        if date_str:
+            for fmt in ["%Y-%m-%d", "%Y/%m/%d"]:
+                try:
+                    item_date = datetime.strptime(date_str, fmt).date()
+                    break
+                except ValueError:
+                    continue
+
+        parsed_items.append({
+            "text": item["text"],
+            "href": item["href"],
+            "date": date_str,
+            "date_obj": item_date,
+            "in_range": item_date is not None and item_date >= cutoff,
+        })
+
+    return parsed_items
 
 
-def fetch_dynamic(url: str, follow_links: bool = True, max_detail_pages: int = 5) -> str:
+def fetch_dynamic(url: str, follow_links: bool = True, max_detail_pages: int = 15) -> dict:
     """
-    动态页面抓取：Playwright headless 浏览器
-    通过文字匹配定位链接，逐个点击并捕获弹窗/详情页
+    动态页面抓取
+    返回 {
+        "list_overview": "列表页概览",
+        "details": [{"title": "标题", "date": "日期", "content": "详情文字"}, ...]
+    }
     """
     from playwright.sync_api import sync_playwright
 
@@ -122,92 +164,138 @@ def fetch_dynamic(url: str, follow_links: bool = True, max_detail_pages: int = 5
         page = context.new_page()
         page.set_default_timeout(PLAYWRIGHT_TIMEOUT)
 
-        all_text_parts = []
+        result = {"list_overview": "", "details": []}
 
         try:
             # 1. 加载列表页
             page.goto(url, wait_until="domcontentloaded")
             page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(3000)
 
             # 2. 提取列表概览
             list_text = _extract_page_text(page)
-            list_preview = list_text[:600].replace("\n", " | ")
-            all_text_parts.append(f"=== 列表页概览 ===\n{list_preview}")
+            result["list_overview"] = list_text[:800]
 
             if not follow_links:
-                all_text_parts.append(f"\n=== 列表页完整内容 ===\n{list_text}")
-                return "\n\n".join(all_text_parts)[:MAX_CONTENT_LENGTH]
+                return result
 
-            # 3. 发现条目
-            items = _find_list_items(page)
-            if len(items) > max_detail_pages:
-                items = items[:max_detail_pages]
-
-            print(f"    [scraper] 发现 {len(items)} 个条目，将逐一提取详情...")
-
-            # 4. 按文字匹配点击（不依赖序号）
+            # 3. 提取条目并过滤日期
+            all_items = _extract_list_items_with_dates(page)
             list_url = page.url
-            for i, item in enumerate(items):
+
+            # 打印所有条目及其日期状态
+            in_range_items = [it for it in all_items if it["in_range"]]
+            out_range_items = [it for it in all_items if not it["in_range"]]
+
+            print(f"    [scraper] 共发现 {len(all_items)} 个条目")
+            if out_range_items:
+                print(f"    [scraper] 跳过 {len(out_range_items)} 个过期条目 (超过3天):")
+                for it in out_range_items:
+                    print(f"             - {it['text'][:50]} (日期: {it.get('date', '未知')})")
+            print(f"    [scraper] 将提取 {len(in_range_items)} 个近3天条目")
+
+            if len(in_range_items) > max_detail_pages:
+                in_range_items = in_range_items[:max_detail_pages]
+
+            # 4. 逐个点击条目，捕获弹窗
+            for i, item in enumerate(in_range_items):
                 item_text = item["text"]
-                print(f"    [scraper] [{i+1}/{len(items)}] {item_text[:50]}...")
+                print(f"    [scraper] [{i+1}/{len(in_range_items)}] {item_text[:60]}...")
 
                 try:
-                    # 按文字匹配定位元素
+                    # ★ 关键：每次重新加载干净的列表页
+                    page.goto(list_url, wait_until="domcontentloaded")
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_timeout(2000)
+
+                    # 按文字精确匹配链接
                     try:
                         target = page.get_by_text(item_text, exact=False).first
-                        if not target:
-                            target = page.locator(f"a:has-text('{item_text[:30]}')").first
                     except Exception:
-                        continue
+                        print(f"             get_by_text 失败，尝试模糊匹配...")
+                        try:
+                            target = page.locator(f"a:text-is('{item_text}')").first
+                        except Exception:
+                            target = page.locator(f"a:has-text('{item_text[:20]}')").first
 
-                    detail_text = ""
+                    detail_content = ""
 
-                    # 尝试捕获弹窗
+                    # 尝试用 expect_page 捕获弹窗
+                    popup_captured = False
                     try:
-                        with context.expect_page(timeout=10000) as popup_event:
-                            target.click(force=True)
+                        with context.expect_page(timeout=12000) as popup_event:
+                            target.click(force=True, timeout=5000)
                         popup_page = popup_event.value
                         popup_page.wait_for_load_state("domcontentloaded", timeout=15000)
-                        popup_page.wait_for_timeout(1000)
-                        detail_text = _extract_page_text(popup_page)
-                        if not detail_text:
-                            detail_text = "[弹窗打开但无文字内容]"
+                        popup_page.wait_for_timeout(1500)
+                        detail_content = _extract_page_text(popup_page)
                         popup_page.close()
-                    except Exception:
-                        # 无弹窗：可能是页面内变化
+                        popup_captured = True
+                    except Exception as e:
+                        # 没有弹窗：检查是否有页面跳转或内容变化
                         page.wait_for_timeout(2000)
                         current_text = _extract_page_text(page)
-                        if current_text[:200] != list_text[:200]:
-                            detail_text = current_text
+                        # 判断内容是否真的变了（不是列表页）
+                        if len(current_text) > 100 and current_text[:200] != list_text[:200]:
+                            detail_content = current_text
                         else:
-                            detail_text = "[点击后内容无变化，可能需额外操作]"
+                            # 可能弹窗被屏蔽，尝试直接获取所有打开的页面
+                            if len(context.pages) > 1:
+                                for pp in context.pages:
+                                    if pp != page:
+                                        try:
+                                            detail_content = _extract_page_text(pp)
+                                            pp.close()
+                                            popup_captured = True
+                                            break
+                                        except Exception:
+                                            pass
 
-                    if len(detail_text) > 2500:
-                        detail_text = detail_text[:2500] + "... [已截断]"
+                    if not popup_captured and not detail_content:
+                        detail_content = "[弹窗未捕获，请检查网站是否屏蔽了弹出窗口]"
 
-                    all_text_parts.append(f"\n=== 详情: {item_text} ===\n{detail_text or '[空]'}")
+                    # 截断过长的单条详情
+                    if len(detail_content) > 3000:
+                        detail_content = detail_content[:3000] + "... [已截断]"
 
-                    time.sleep(3)
+                    result["details"].append({
+                        "title": item_text,
+                        "date": item.get("date", "未知"),
+                        "content": detail_content,
+                    })
+
+                    time.sleep(3)  # 请求间隔
 
                 except Exception as e:
-                    all_text_parts.append(f"\n=== 详情: {item_text} ===\n[失败: {e}]")
+                    print(f"             [失败] {e}")
+                    result["details"].append({
+                        "title": item_text,
+                        "date": item.get("date", "未知"),
+                        "content": f"[提取失败: {e}]",
+                    })
                     time.sleep(2)
 
         except Exception as e:
-            all_text_parts.append(f"[Playwright 失败: {e}]")
+            print(f"    [scraper] 致命错误: {e}")
         finally:
             browser.close()
 
-    text = "\n\n".join(all_text_parts)
-    if len(text) > MAX_CONTENT_LENGTH:
-        text = text[:MAX_CONTENT_LENGTH] + "\n\n... [内容过长，已截断]"
-    return text
+    return result
 
 
 def fetch_url(url: str, use_dynamic: bool = False) -> str:
-    """统一入口"""
+    """
+    统一入口：返回合并后的文本（兼容旧接口）
+    动态页面 = 列表概览 + 各详情拼接
+    """
     if use_dynamic:
-        return fetch_dynamic(url, follow_links=True)
+        data = fetch_dynamic(url, follow_links=True)
+        parts = [f"=== 列表页概览 ===\n{data['list_overview']}"]
+        for d in data["details"]:
+            parts.append(f"\n=== 详情: {d['title']} (日期: {d['date']}) ===\n{d['content']}")
+        text = "\n\n".join(parts)
+        if len(text) > MAX_CONTENT_LENGTH:
+            text = text[:MAX_CONTENT_LENGTH] + "\n\n... [内容过长，已截断]"
+        return text
     else:
         return fetch_static(url)

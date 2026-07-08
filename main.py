@@ -12,12 +12,11 @@ import io
 import argparse
 from datetime import datetime
 
-# 修复 Windows GBK 编码问题
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 from database import init_db, add_url, delete_url, list_urls, get_active_urls, save_snapshot, get_latest_morning_snapshot
-from scraper import fetch_url
-from analyzer import analyze_morning, analyze_evening
+from scraper import fetch_url, fetch_dynamic
+from analyzer import analyze_morning, analyze_evening, analyze_summary, analyze_structured
 from mailer import send_email
 
 
@@ -42,12 +41,8 @@ def cmd_delete(args):
         identifier = int(identifier)
     except ValueError:
         pass
-
     ok = delete_url(identifier)
-    if ok:
-        print(f"[OK] 已删除: {identifier}")
-    else:
-        print(f"[ERROR] 未找到: {identifier}")
+    print(f"[OK] 已删除: {identifier}" if ok else f"[ERROR] 未找到: {identifier}")
 
 
 def cmd_list(args):
@@ -56,7 +51,6 @@ def cmd_list(args):
     if not urls:
         print("暂无监控网址，使用 'add' 命令添加")
         return
-
     print(f"\n监控网址列表 (共 {len(urls)} 个):\n")
     print(f"{'ID':<4} {'名称':<16} {'分类':<10} {'类型':<8} {'URL'}")
     print("-" * 80)
@@ -67,8 +61,84 @@ def cmd_list(args):
         print(f"{u['id']:<4} {name:<16} {cat:<10} {d_type:<8} {u['url']}")
 
 
+def _process_url(url_record: dict, is_morning: bool) -> dict:
+    """
+    处理单个网址：抓取 → 分析 → 返回结构化报告
+    """
+    name = url_record["name"] or url_record["url"]
+    url = url_record["url"]
+    use_dynamic = bool(url_record["use_dynamic"])
+
+    report = {
+        "url_name": name,
+        "url": url,
+        "summary": {},
+        "structured": [],
+        "details": [],      # 原始抓取详情（供邮件展示原文）
+        "changes": [],
+    }
+
+    # === 1. 抓取 ===
+    print(f"    抓取网页...")
+    try:
+        if use_dynamic:
+            data = fetch_dynamic(url, follow_links=True)
+            list_overview = data["list_overview"]
+            details = data["details"]
+            # 从抓到数据中构建快照文本（不再重复调用 fetch_dynamic）
+            parts = [f"=== 列表页 ===\n{list_overview}"]
+            for d in details:
+                parts.append(f"\n=== {d['title']} ({d.get('date', '?')}) ===\n{d['content']}")
+            full_content = "\n\n".join(parts)
+        else:
+            full_content = fetch_url(url, use_dynamic=False)
+            list_overview = full_content
+            details = []
+    except Exception as e:
+        print(f"    [ERROR] 抓取失败: {e}")
+        report["summary"] = {"category": "抓取失败", "summary": str(e), "keywords": []}
+        return report
+
+    # === 2. 分析 ===
+    if is_morning:
+        print(f"    分析列表概览...")
+        report["summary"] = analyze_summary(list_overview, url_name=name)
+
+        if details and use_dynamic:
+            print(f"    结构化提取 {len(details)} 条详情...")
+            report["structured"] = analyze_structured(details, url_name=name)
+            report["details"] = details  # 保留原始详情供邮件展示
+
+        # 保存快照
+        save_snapshot(url_record["id"], full_content,
+                      report["summary"].get("summary", ""),
+                      report["summary"].get("keywords", []),
+                      is_morning=True)
+    else:
+        # 晚上：对比上午快照
+        morning_snap = get_latest_morning_snapshot(url_record["id"])
+        morning_content = morning_snap["content"] if morning_snap else ""
+
+        print(f"    分析+对比上午快照...")
+        evening_analysis = analyze_evening(morning_content, full_content, url_name=name)
+        report["summary"] = evening_analysis
+        report["changes"] = evening_analysis.get("changes", [])
+
+        if details and use_dynamic:
+            print(f"    结构化提取 {len(details)} 条详情...")
+            report["structured"] = analyze_structured(details, url_name=name)
+            report["details"] = details
+
+        save_snapshot(url_record["id"], full_content,
+                      evening_analysis.get("summary", ""),
+                      evening_analysis.get("keywords", []),
+                      is_morning=False)
+
+    return report
+
+
 def cmd_run(args):
-    """执行一次完整的抓取->分析->发送流程"""
+    """执行一次完整的抓取→分析→发送流程"""
     hour = datetime.now().hour
     is_morning = args.morning or (not args.evening and hour < 15)
 
@@ -81,65 +151,18 @@ def cmd_run(args):
         print("暂无监控网址")
         return
 
-    results = []
-
+    reports = []
     for i, u in enumerate(urls):
         name = u["name"] or u["url"]
-        print(f"[{i+1}/{len(urls)}] 抓取: {name} ...")
+        print(f"[{i+1}/{len(urls)}] {name}")
+        report = _process_url(u, is_morning)
+        reports.append(report)
+        print()
 
-        # 1. 抓取网页
-        try:
-            content = fetch_url(u["url"], use_dynamic=bool(u["use_dynamic"]))
-            content_preview = content[:80].replace("\n", " ")
-            print(f"    抓取成功 ({len(content)} 字符): {content_preview}...")
-        except Exception as e:
-            print(f"    [ERROR] 抓取失败: {e}")
-            results.append({
-                "url_name": name, "url": u["url"],
-                "category": "抓取失败", "summary": str(e),
-                "keywords": [], "changes": [],
-            })
-            continue
-
-        # 2. LLM 分析
-        if is_morning:
-            print(f"    分析中...")
-            analysis = analyze_morning(content, url_name=name)
-            keywords = analysis.get("keywords", [])
-            print(f"    分类: {analysis.get('category')}, 关键词: {keywords}")
-
-            save_snapshot(u["id"], content, analysis.get("summary", ""), keywords, is_morning=True)
-
-            results.append({
-                "url_name": name, "url": u["url"],
-                "category": analysis.get("category", ""),
-                "summary": analysis.get("summary", ""),
-                "keywords": keywords,
-                "changes": [],
-            })
-        else:
-            morning_snap = get_latest_morning_snapshot(u["id"])
-            morning_content = morning_snap["content"] if morning_snap else ""
-            print(f"    分析+对比上午快照...")
-            analysis = analyze_evening(morning_content, content, url_name=name)
-            keywords = analysis.get("keywords", [])
-            changes = analysis.get("changes", [])
-            print(f"    分类: {analysis.get('category')}, 变化: {len(changes)} 项")
-
-            save_snapshot(u["id"], content, analysis.get("summary", ""), keywords, is_morning=False)
-
-            results.append({
-                "url_name": name, "url": u["url"],
-                "category": analysis.get("category", ""),
-                "summary": analysis.get("summary", ""),
-                "keywords": keywords,
-                "changes": changes,
-            })
-
-    # 3. 发送邮件
-    print(f"\n发送邮件...")
-    if results:
-        send_email(results, is_morning=is_morning)
+    # 发送邮件
+    print("发送邮件...")
+    if reports:
+        send_email(reports, is_morning=is_morning)
     else:
         print("   无结果，跳过邮件")
 
@@ -147,17 +170,39 @@ def cmd_run(args):
 
 
 def cmd_test(args):
-    """测试抓取单个网址（不保存，不发邮件）"""
+    """测试抓取单个网址"""
     print(f"\n测试抓取: {args.url}")
-    print(f"   类型: {'动态(Playwright)' if args.dynamic else '静态(requests)'}\n")
+    d_type = "动态(Playwright)" if args.dynamic else "静态(requests)"
+    print(f"   类型: {d_type}\n")
 
-    try:
-        content = fetch_url(args.url, use_dynamic=args.dynamic)
+    if args.dynamic:
+        data = fetch_dynamic(args.url, follow_links=True)
+        print(f"列表页长度: {len(data['list_overview'])} 字符")
+        print(f"详情条目数: {len(data['details'])}")
+
+        print(f"\n{'='*60}")
+        print(data['list_overview'][:500])
+        print(f"{'='*60}")
+
+        if data["details"]:
+            print(f"\n--- 第1条详情预览 (共{len(data['details'])}条) ---")
+            first = data["details"][0]
+            print(f"标题: {first['title']}")
+            print(f"日期: {first['date']}")
+            print(f"内容 ({len(first['content'])} 字符):")
+            print(first['content'][:800])
+            if len(first['content']) > 800:
+                print(f"... [剩余 {len(first['content'])-800} 字符]")
+
+            print(f"\n测试 LLM 结构化提取...")
+            structured = analyze_structured(data["details"][:3], url_name=args.url)
+            for s in structured:
+                print(f"  - {s.get('title','?')[:40]} | {s.get('company','?')} | {s.get('salary','?')} | {s.get('location','?')}")
+    else:
+        content = fetch_url(args.url, use_dynamic=False)
         print(f"抓取成功，共 {len(content)} 字符\n")
         print("=" * 60)
         print(content[:2000])
-        if len(content) > 2000:
-            print(f"\n... [剩余 {len(content) - 2000} 字符未显示]")
         print("=" * 60)
 
         print("\n测试 LLM 分析...")
@@ -165,9 +210,6 @@ def cmd_test(args):
         print(f"   分类: {analysis.get('category')}")
         print(f"   摘要: {analysis.get('summary')}")
         print(f"   关键词: {analysis.get('keywords')}")
-
-    except Exception as e:
-        print(f"[ERROR] 失败: {e}")
 
 
 def main():
