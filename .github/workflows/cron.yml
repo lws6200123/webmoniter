@@ -1,4 +1,4 @@
-name: Web Monitor — 每日招聘信息抓取
+name: Web Monitor
 
 on:
   schedule:
