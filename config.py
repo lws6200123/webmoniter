@@ -35,7 +35,7 @@ SNAPSHOT_DIR = BASE_DIR / "data" / "snapshots"
 
 # --- 抓取配置 ---
 REQUEST_TIMEOUT = 30  # HTTP 请求超时(秒)
-MAX_CONTENT_LENGTH = 8000  # 送入 LLM 的最大字符数（控制成本）
+MAX_CONTENT_LENGTH = 15000  # 送入 LLM 的最大字符数（控制成本）
 PLAYWRIGHT_TIMEOUT = 60000  # Playwright 页面加载超时(毫秒)
 
 # --- 邮件标题 ---

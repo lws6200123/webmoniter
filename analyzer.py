@@ -129,7 +129,7 @@ def analyze_structured(details: list[dict], url_name: str = "", batch_size: int 
                 f"【信息{batch_start + i + 1}】\n"
                 f"原标题: {d.get('title', '未知')}\n"
                 f"日期: {d.get('date', '未知')}\n"
-                f"内容:\n{d.get('content', '无内容')[:2000]}\n"  # 每条限2000字符
+                f"内容:\n{d.get('content', '无内容')[:3000]}\n"  # 每条限3000字符
             )
 
         user_message = f"网页来源: {url_name}\n\n" + "\n---\n".join(items_text)
