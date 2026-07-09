@@ -2,8 +2,8 @@
 .env
 
 # 本地数据
-data/urls.db
 data/snapshots/
+data/cron.log
 
 # Python
 __pycache__/
