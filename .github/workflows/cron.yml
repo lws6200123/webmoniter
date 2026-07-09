@@ -39,10 +39,8 @@ jobs:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python main.py run
 
-      - name: 上传日志（调试用）
+      - name: 创建日志
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cron-log
-          path: data/cron.log
-          retention-days: 3
+        run: |
+          mkdir -p data
+          echo "Run completed at $(date -u)" >> data/cron.log
