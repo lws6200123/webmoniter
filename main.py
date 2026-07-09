@@ -17,7 +17,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 from database import init_db, add_url, delete_url, list_urls, get_active_urls, save_snapshot, get_latest_morning_snapshot
 from scraper import fetch_url, fetch_dynamic
 from analyzer import analyze_morning, analyze_evening, analyze_summary, analyze_structured
-from mailer import send_email
+from mailer import notify
 
 
 def cmd_add(args):
@@ -159,10 +159,10 @@ def cmd_run(args):
         reports.append(report)
         print()
 
-    # 发送邮件
-    print("发送邮件...")
+    # 发送通知
+    print("发送通知...")
     if reports:
-        send_email(reports, is_morning=is_morning)
+        notify(reports, is_morning=is_morning)
     else:
         print("   无结果，跳过邮件")
 

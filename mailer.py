@@ -1,15 +1,18 @@
 """
-邮件发送模块：QQ邮箱 SMTP，HTML 格式
+通知模块：QQ邮箱 SMTP + PushPlus 微信推送
 直接展示网页原文内容，关键信息加粗高亮
 """
 import re
+import json
 import smtplib
+import urllib.request
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from config import (
     SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, RECIPIENT_EMAIL,
     EMAIL_SUBJECT_MORNING, EMAIL_SUBJECT_EVENING,
+    PUSHPLUS_TOKEN,
 )
 
 # 需要高亮的字段关键词（正则）
@@ -271,3 +274,118 @@ def send_email(report_or_reports, is_morning: bool = True) -> bool:
     except Exception as e:
         print(f"[mailer] 邮件发送失败: {e}")
         return False
+
+
+def send_pushplus(report_or_reports, is_morning: bool = True) -> bool:
+    """
+    通过 PushPlus 推送到微信（GitHub Actions 环境的主力渠道）
+    免费注册: http://www.pushplus.plus/ → 获取 Token
+    """
+    if not PUSHPLUS_TOKEN:
+        print("[pushplus] 未配置 PUSHPLUS_TOKEN，跳过推送")
+        return False
+
+    tag = "上午版" if is_morning else "晚间版(含变化)"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # 构建纯文本摘要（PushPlus 免费版不支持太复杂的 HTML）
+    if isinstance(report_or_reports, list):
+        text_parts = [f"📊 网页监控日报 — {tag}\n生成时间: {now}\n"]
+        for r in report_or_reports:
+            url_name = r.get("url_name", "未知")
+            summary = r.get("summary", {}).get("summary", "无摘要")
+            structured = r.get("structured", [])
+            text_parts.append(f"\n{'='*40}")
+            text_parts.append(f"【{url_name}】")
+            text_parts.append(f"摘要: {summary}")
+
+            if structured:
+                text_parts.append(f"\n共 {len(structured)} 条招聘信息:")
+                for s in structured[:10]:
+                    company = s.get("company", "")
+                    salary = s.get("salary", "")
+                    location = s.get("location", "")
+                    title = s.get("title", "")[:50]
+                    parts = [title]
+                    if company and company != "未注明":
+                        parts.append(f"🏢{company}")
+                    if salary and salary != "未注明":
+                        parts.append(f"💰{salary}")
+                    if location and location != "未注明":
+                        parts.append(f"📍{location}")
+                    text_parts.append(f"  • {' | '.join(parts)}")
+    else:
+        text_parts = [f"📊 网页监控日报 — {tag}\n生成时间: {now}\n"]
+        r = report_or_reports
+        url_name = r.get("url_name", "未知")
+        summary = r.get("summary", {}).get("summary", "无摘要")
+        structured = r.get("structured", [])
+        text_parts.append(f"【{url_name}】\n摘要: {summary}")
+        if structured:
+            text_parts.append(f"\n共 {len(structured)} 条招聘信息:")
+            for s in structured[:10]:
+                company = s.get("company", "")
+                salary = s.get("salary", "")
+                location = s.get("location", "")
+                title = s.get("title", "")[:50]
+                parts = [title]
+                if company and company != "未注明":
+                    parts.append(f"{company}")
+                if salary and salary != "未注明":
+                    parts.append(f"{salary}")
+                if location and location != "未注明":
+                    parts.append(f"{location}")
+                text_parts.append(f"  • {' | '.join(parts)}")
+
+    text_body = "\n".join(text_parts)
+    if len(text_body) > 5000:
+        text_body = text_body[:5000] + "\n\n... [内容过长已截断]"
+
+    subject = "网页监控日报" if is_morning else "网页监控晚报(含变化)"
+
+    try:
+        data = json.dumps({
+            "token": PUSHPLUS_TOKEN,
+            "title": subject,
+            "content": text_body,
+            "template": "txt",
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "http://www.pushplus.plus/send",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("code") == 200:
+            print(f"[pushplus] 微信推送成功")
+            return True
+        else:
+            print(f"[pushplus] 推送失败: {result}")
+            return False
+    except Exception as e:
+        print(f"[pushplus] 推送异常: {e}")
+        return False
+
+
+def notify(report_or_reports, is_morning: bool = True):
+    """
+    统一通知入口：优先发邮件，失败则降级到 PushPlus
+    如果 PushPlus 配置了也会同时发
+    """
+    email_ok = False
+    pushplus_ok = False
+
+    # 尝试邮件
+    if SMTP_USER and SMTP_PASSWORD:
+        email_ok = send_email(report_or_reports, is_morning)
+
+    # 尝试 PushPlus（无论邮件是否成功都发，互为补充）
+    if PUSHPLUS_TOKEN:
+        pushplus_ok = send_pushplus(report_or_reports, is_morning)
+
+    if not email_ok and not pushplus_ok:
+        print("[notify] 所有通知渠道均失败！请检查配置。")
+    elif email_ok or pushplus_ok:
+        print(f"[notify] 通知已发送 (邮件={'OK' if email_ok else 'FAIL'}, PushPlus={'OK' if pushplus_ok else 'N/A'})")

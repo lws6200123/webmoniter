@@ -1,0 +1,44 @@
+name: Web Monitor — 每日招聘信息抓取
+
+on:
+  schedule:
+    # 北京时间 9:00 = UTC 1:00，北京时间 21:00 = UTC 13:00
+    - cron: '0 1,13 * * *'
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+
+      - name: 执行抓取任务
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python main.py run
+
+      - name: 上传日志（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cron-log
+          path: data/cron.log
+          retention-days: 3

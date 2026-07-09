@@ -19,6 +19,10 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "")
 
+# --- PushPlus 推送（GitHub Actions 环境的备用渠道）---
+# 免费注册: http://www.pushplus.plus/ → 获取 Token → 推送到微信
+PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN", "")
+
 # SMTP 服务器配置
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465  # SSL
