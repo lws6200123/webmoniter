@@ -278,78 +278,60 @@ def send_email(report_or_reports, is_morning: bool = True) -> bool:
 
 def send_pushplus(report_or_reports, is_morning: bool = True) -> bool:
     """
-    通过 PushPlus 推送到微信（GitHub Actions 环境的主力渠道）
-    免费注册: http://www.pushplus.plus/ → 获取 Token
+    通过 PushPlus 推送到微信，复用邮件同款 HTML 富文本
     """
     if not PUSHPLUS_TOKEN:
         print("[pushplus] 未配置 PUSHPLUS_TOKEN，跳过推送")
         return False
 
-    tag = "上午版" if is_morning else "晚间版(含变化)"
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    # 构建纯文本摘要（PushPlus 免费版不支持太复杂的 HTML）
-    if isinstance(report_or_reports, list):
-        text_parts = [f"📊 网页监控日报 — {tag}\n生成时间: {now}\n"]
-        for r in report_or_reports:
-            url_name = r.get("url_name", "未知")
-            summary = r.get("summary", {}).get("summary", "无摘要")
-            structured = r.get("structured", [])
-            text_parts.append(f"\n{'='*40}")
-            text_parts.append(f"【{url_name}】")
-            text_parts.append(f"摘要: {summary}")
-
-            if structured:
-                text_parts.append(f"\n共 {len(structured)} 条招聘信息:")
-                for s in structured[:10]:
-                    company = s.get("company", "")
-                    salary = s.get("salary", "")
-                    location = s.get("location", "")
-                    title = s.get("title", "")[:50]
-                    parts = [title]
-                    if company and company != "未注明":
-                        parts.append(f"🏢{company}")
-                    if salary and salary != "未注明":
-                        parts.append(f"💰{salary}")
-                    if location and location != "未注明":
-                        parts.append(f"📍{location}")
-                    text_parts.append(f"  • {' | '.join(parts)}")
-    else:
-        text_parts = [f"📊 网页监控日报 — {tag}\n生成时间: {now}\n"]
-        r = report_or_reports
-        url_name = r.get("url_name", "未知")
-        summary = r.get("summary", {}).get("summary", "无摘要")
-        structured = r.get("structured", [])
-        text_parts.append(f"【{url_name}】\n摘要: {summary}")
-        if structured:
-            text_parts.append(f"\n共 {len(structured)} 条招聘信息:")
-            for s in structured[:10]:
-                company = s.get("company", "")
-                salary = s.get("salary", "")
-                location = s.get("location", "")
-                title = s.get("title", "")[:50]
-                parts = [title]
-                if company and company != "未注明":
-                    parts.append(f"{company}")
-                if salary and salary != "未注明":
-                    parts.append(f"{salary}")
-                if location and location != "未注明":
-                    parts.append(f"{location}")
-                text_parts.append(f"  • {' | '.join(parts)}")
-
-    text_body = "\n".join(text_parts)
-    if len(text_body) > 5000:
-        text_body = text_body[:5000] + "\n\n... [内容过长已截断]"
-
     subject = "网页监控日报" if is_morning else "网页监控晚报(含变化)"
+
+    # 复用 build_html_body 生成和邮件完全相同的富文本内容
+    # 多个 report 时，用相同的拼接逻辑
+    if isinstance(report_or_reports, list):
+        html_parts = [build_html_body(r, is_morning) for r in report_or_reports]
+        # 去掉每个片段外层 <html><body> 包裹，只保留内容
+        cleaned = []
+        for hp in html_parts:
+            # 提取 <body> 内部内容
+            body_match = re.search(r'<body[^>]*>(.*?)</body>', hp, re.DOTALL)
+            if body_match:
+                cleaned.append(body_match.group(1))
+            else:
+                cleaned.append(hp)
+        html_content = "\n<hr style='border:2px dashed #1a73e8;margin:24px 0;'>\n".join(cleaned)
+        # 添加外层样式
+        html_content = f"""<div style="font-family:'Microsoft YaHei','PingFang SC',sans-serif;max-width:750px;padding:10px;">
+{html_content}
+<p style="color:#999;font-size:11px;text-align:center;margin-top:16px;">由 Web Monitor 自动生成</p>
+</div>"""
+    else:
+        html_content = build_html_body(report_or_reports, is_morning)
 
     try:
         data = json.dumps({
             "token": PUSHPLUS_TOKEN,
             "title": subject,
-            "content": text_body,
-            "template": "txt",
+            "content": html_content,
+            "template": "html",
         }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "http://www.pushplus.plus/send",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("code") == 200:
+            print(f"[pushplus] 微信推送成功")
+            return True
+        else:
+            print(f"[pushplus] 推送失败: {result}")
+            return False
+    except Exception as e:
+        print(f"[pushplus] 推送异常: {e}")
+        return False
 
         req = urllib.request.Request(
             "http://www.pushplus.plus/send",
